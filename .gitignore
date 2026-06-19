@@ -1,0 +1,5 @@
+#ignore folder Offline_Training_Results
+
+*Offline_Training_Results*
+5_Trial19_CrossSession_Inference.py
+test_csv.py
