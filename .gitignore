@@ -3,3 +3,13 @@
 *Offline_Training_Results*
 5_Trial19_CrossSession_Inference.py
 test_csv.py
+Fixed_IMU_Data
+
+#ignore python files that dont include 4_ or 5_
+*.py
+!4*.py
+!5*.py
+
+# Re-ignore specific files so they stay ignored
+5_Trial19_CrossSession_Inference.py
+test_csv.py
