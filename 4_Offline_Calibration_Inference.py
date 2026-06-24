@@ -243,7 +243,31 @@ def build_sequences(raw_trials, scaler, is_train=False):
         t_idx += 1
     if len(X_all) == 0:
         return np.array([]), np.array([]), np.array([])
-    return np.array(X_all), np.array(Y_raw), np.array(groups)
+        
+    X_arr = np.array(X_all)
+    Y_arr = np.array(Y_raw)
+    groups_arr = np.array(groups)
+    
+    if is_train:
+        # Balance Rest class to match the average support of other classes
+        unique_classes, counts = np.unique(Y_arr, return_counts=True)
+        non_rest_counts = [count for cls, count in zip(unique_classes, counts) if cls != "Rest"]
+        if non_rest_counts and "Rest" in unique_classes:
+            target_rest_count = int(np.mean(non_rest_counts))
+            rest_indices = np.where(Y_arr == "Rest")[0]
+            non_rest_indices = np.where(Y_arr != "Rest")[0]
+            
+            if len(rest_indices) > target_rest_count:
+                rng = np.random.RandomState(42)
+                keep_rest_indices = rng.choice(rest_indices, target_rest_count, replace=False)
+                keep_indices = np.concatenate([non_rest_indices, keep_rest_indices])
+                keep_indices.sort()
+                
+                X_arr = X_arr[keep_indices]
+                Y_arr = Y_arr[keep_indices]
+                groups_arr = groups_arr[keep_indices]
+                
+    return X_arr, Y_arr, groups_arr
 
 # ============================================================================
 # MODEL DEFINITION
@@ -273,9 +297,9 @@ def create_model(input_shape, num_classes, cnn_filters=64, kernel_size=3, lstm_u
 # MAIN PIPELINE
 # ============================================================================
 def main():
-    base_dir = r"C:\Users\Lucy\Desktop\Anticipation_Delsys\Synchronised_Trials"
-    
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.join(script_dir, "extracted_trials")
+    
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir = os.path.join(script_dir, "Offline_Training_Results", timestamp)
     os.makedirs(out_dir, exist_ok=True)
@@ -286,19 +310,16 @@ def main():
     dataset = collections.defaultdict(list)
     channel_types = None
     
-    trial_folders = sorted(glob.glob(os.path.join(base_dir, "Trial_*_short_*")))
+    trial_folders = sorted(glob.glob(os.path.join(base_dir, "Trial_*_*_Short")))
     for tf_path in trial_folders:
         folder_name = os.path.basename(tf_path)
-        # Extract class label (e.g., Trial_04_short_ball -> ball)
-        cls_label = folder_name.split("short_")[-1]
-        
-        movements_dir = os.path.join(tf_path, "extracted_trials")
-        if not os.path.isdir(movements_dir):
+        parts = folder_name.split("_")
+        if len(parts) >= 3:
+            cls_label = parts[2].lower()
+        else:
             continue
             
-        movement_folders = sorted(glob.glob(os.path.join(movements_dir, "Movement_*")))
-        for mov_dir in movement_folders:
-            csv_path = os.path.join(mov_dir, "delsys_data.csv")
+        for csv_path in sorted(glob.glob(os.path.join(tf_path, "movement_*.csv"))):
             if not os.path.isfile(csv_path):
                 continue
                 
@@ -503,6 +524,10 @@ def main():
         subset_trial_accuracies = []
         subset_pred_times = None
         
+        global_true = []
+        global_preds = []
+        global_pred_times = None
+        
         for cls_name, trials in test_ds.items():
             cls_idx = le.transform([cls_name])[0]
             
@@ -540,8 +565,13 @@ def main():
                 if cls_name in target_subset_classes:
                     subset_trial_accuracies.append(accuracies)
                 
+                global_true.append(cls_idx)
+                global_preds.append(pred_classes)
+                
                 if pred_times is None:
                     pred_times = [(e / EMG_FS) - 1.5 for s, e in sub_wins]
+                if global_pred_times is None:
+                    global_pred_times = pred_times
                 if cls_name in target_subset_classes and subset_pred_times is None:
                     subset_pred_times = [(e / EMG_FS) - 1.5 for s, e in sub_wins]
                     
@@ -581,6 +611,45 @@ def main():
             plt.savefig(os.path.join(plot_dir, f"Average_Subset_MugCardBottle.png"), dpi=150)
             plt.close()
             
+        if global_preds:
+            global_min_len = min(len(p) for p in global_preds)
+            global_preds_trunc = np.array([p[:global_min_len] for p in global_preds])
+            global_true_arr = np.array(global_true)
+            global_times_trunc = global_pred_times[:global_min_len]
+            
+            overall_accuracies = []
+            metrics_dir = os.path.join(out_dir, "Metrics_Over_Time")
+            os.makedirs(metrics_dir, exist_ok=True)
+            
+            for t_i in range(global_min_len):
+                y_pred_t = global_preds_trunc[:, t_i]
+                acc_t = accuracy_score(global_true_arr, y_pred_t) * 100.0
+                overall_accuracies.append(acc_t)
+                
+                t_val = global_times_trunc[t_i]
+                cm_t = confusion_matrix(global_true_arr, y_pred_t, labels=range(len(le.classes_)))
+                plt.figure(figsize=(8, 6))
+                sns.heatmap(cm_t, annot=True, fmt='d', cmap='Blues', xticklabels=le.classes_, yticklabels=le.classes_)
+                plt.title(f"Confusion Matrix (t={t_val:+.2f}s)\nAccuracy: {acc_t:.1f}%")
+                plt.ylabel('True')
+                plt.xlabel('Predicted')
+                plt.tight_layout()
+                plt.savefig(os.path.join(metrics_dir, f"cm_t_{t_val:+.2f}s.png"))
+                plt.close()
+                
+            plt.figure(figsize=(10, 6))
+            plt.plot(global_times_trunc, overall_accuracies, marker='o', linewidth=2)
+            plt.axvline(x=0.0, color='r', linestyle='--', label='Movement Onset')
+            plt.title('Overall Accuracy Over Time')
+            plt.xlabel('Time Relative to Onset (s)')
+            plt.ylabel('Accuracy (%)')
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "Overall_Accuracy_Over_Time.png"))
+            plt.close()
+            print(f"Saved timestep confusion matrices to {metrics_dir}")
+
         print(f"Saved sliding window average accuracy plots to {plot_dir}")
     else:
         print("No test set sequences could be extracted.")
