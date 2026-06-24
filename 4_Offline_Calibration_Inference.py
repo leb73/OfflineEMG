@@ -41,7 +41,7 @@ print("starting")
 EMG_FS          = 1926.0
 WINDOW_SIZE_MS  = 150             
 OVERLAP_MS      = 75
-SEQUENCE_LENGTH = 19
+SEQUENCE_LENGTH = 5
 L2_REG = 0.002
 
 # ============================================================================
@@ -185,6 +185,66 @@ def get_sub_windows(df_len, window_samples, step_samples):
         start += step_samples
     return windows
 
+def extract_raw_features(ds_dict, window_samples, step_samples, channel_types):
+    raw_trials = []
+    for cls_name, trials in ds_dict.items():
+        for arr in trials:
+            sub_wins = get_sub_windows(len(arr), window_samples, step_samples)
+            if len(sub_wins) < SEQUENCE_LENGTH:
+                continue
+            feat_seq = []
+            for s, e in sub_wins:
+                feat = extract_window_features(arr[s:e], EMG_FS, channel_types)
+                feat_seq.append(feat)
+            feat_seq = np.array(feat_seq)
+            if len(feat_seq) >= 5:
+                baseline_mean = np.mean(feat_seq[:5], axis=0, keepdims=True)
+                feat_seq = feat_seq - baseline_mean
+            raw_trials.append((feat_seq, cls_name))
+    return raw_trials
+
+def build_sequences(raw_trials, scaler, is_train=False):
+    X_all, Y_raw, groups = [], [], []
+    t_idx = 0
+    for feat_seq, cls_name in raw_trials:
+        feat_seq = scaler.transform(feat_seq)
+        
+        if is_train:
+            # Burst sequences (preparation phase)
+            start_idx = max(0, len(feat_seq) - 1)
+            for i in range(start_idx, len(feat_seq)):
+                seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
+                if len(seq) < SEQUENCE_LENGTH:
+                    pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
+                    seq = pad + list(seq)
+                X_all.append(seq)
+                Y_raw.append(cls_name)
+                groups.append(t_idx)
+                
+            # Rest sequences (pure baseline noise phase)
+            for i in range(0, min(5, len(feat_seq))):
+                seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
+                if len(seq) < SEQUENCE_LENGTH:
+                    pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
+                    seq = pad + list(seq)
+                X_all.append(seq)
+                Y_raw.append("Rest")
+                groups.append(t_idx)
+        else:
+            for i in range(len(feat_seq)):
+                seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
+                if len(seq) < SEQUENCE_LENGTH:
+                    pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
+                    seq = pad + list(seq)
+                X_all.append(seq)
+                Y_raw.append(cls_name)
+                groups.append(t_idx)
+                
+        t_idx += 1
+    if len(X_all) == 0:
+        return np.array([]), np.array([]), np.array([])
+    return np.array(X_all), np.array(Y_raw), np.array(groups)
+
 # ============================================================================
 # MODEL DEFINITION
 # ============================================================================
@@ -258,12 +318,11 @@ def main():
                 df = df[(df[time_col] >= -1.5) & (df[time_col] <= 0.0)].reset_index(drop=True)
                 
                 emg_cols = [c for c in df.columns if 'EMG' in c and '(mV)' in c]
-                acc_cols = [c for c in df.columns if 'ACC' in c and '(G)' in c]
                 
                 if channel_types is None:
-                    channel_types = [0] * len(emg_cols) + [1] * len(acc_cols)
+                    channel_types = [0] * len(emg_cols)
                     
-                df_data = df[emg_cols + acc_cols].apply(pd.to_numeric, errors='coerce').ffill().fillna(0.0)
+                df_data = df[emg_cols].apply(pd.to_numeric, errors='coerce').ffill().fillna(0.0)
                 raw_data = df_data.values
                 
                 # Apply filters as per the original GUI pipeline
@@ -281,7 +340,8 @@ def main():
     for cls, trials in dataset.items():
         print(f"  {cls}: {len(trials)} trials")
         
-    classes = list(dataset.keys())
+    classes = sorted(list(dataset.keys()))
+    classes.append("Rest")
     le = LabelEncoder()
     le.fit(classes)
     
@@ -315,38 +375,17 @@ def main():
     window_samples = int((WINDOW_SIZE_MS / 1000) * EMG_FS)
     step_samples   = int(((WINDOW_SIZE_MS - OVERLAP_MS) / 1000) * EMG_FS)
     
-    def extract_sequences(ds_dict):
-        X_all, Y_raw, groups = [], [], []
-        t_idx = 0
-        for cls_name, trials in ds_dict.items():
-            for arr in trials:
-                sub_wins = get_sub_windows(len(arr), window_samples, step_samples)
-                if len(sub_wins) < SEQUENCE_LENGTH:
-                    continue
-                feat_seq = []
-                for s, e in sub_wins:
-                    feat = extract_window_features(arr[s:e], EMG_FS, channel_types)
-                    feat_seq.append(feat)
-                    
-                feat_seq = np.array(feat_seq)
-                feat_mean = np.mean(feat_seq, axis=0, keepdims=True)
-                feat_std = np.std(feat_seq, axis=0, keepdims=True)
-                feat_std[feat_std == 0] = 1e-10
-                feat_seq = (feat_seq - feat_mean) / feat_std
-                    
-                num_sequences = len(sub_wins) - SEQUENCE_LENGTH + 1
-                for i in range(num_sequences):
-                    X_all.append(feat_seq[i:i+SEQUENCE_LENGTH])
-                    Y_raw.append(cls_name)
-                    groups.append(t_idx)
-                t_idx += 1
-        if len(X_all) == 0:
-            return np.array([]), np.array([]), np.array([])
-        return np.array(X_all), np.array(Y_raw), np.array(groups)
-        
     print("\nExtracting Features (this may take a moment)...")
-    X_train, Y_train_raw, _ = extract_sequences(train_ds)
-    X_val, Y_val_raw, val_groups = extract_sequences(val_ds)
+    train_raw = extract_raw_features(train_ds, window_samples, step_samples, channel_types)
+    val_raw = extract_raw_features(val_ds, window_samples, step_samples, channel_types)
+    
+    scaler = StandardScaler()
+    all_train_feats = np.vstack([t[0] for t in train_raw]) if train_raw else np.array([])
+    if len(all_train_feats) > 0:
+        scaler.fit(all_train_feats)
+        
+    X_train, Y_train_raw, _ = build_sequences(train_raw, scaler, is_train=True)
+    X_val, Y_val_raw, val_groups = build_sequences(val_raw, scaler, is_train=True)
     
     if len(X_train) == 0 or len(X_val) == 0:
         print("Not enough sequences for training/validation. Exiting.")
@@ -410,19 +449,22 @@ def main():
     # Combine Train + Val for final fit
     X_full = np.concatenate([X_t, X_v])
     Y_full = np.concatenate([Y_train, Y_val])
-    f_es = callbacks.EarlyStopping(monitor='loss', patience=6, restore_best_weights=True)
-    
     print("\nTraining final model on combined Train+Val sets...")
-    final_model.fit(X_full, Y_full, epochs=30, batch_size=8, callbacks=[f_es], verbose=1)
+    final_model.fit(X_full, Y_full, epochs=20, batch_size=8, verbose=1)
     
     # Save the model so we don't lose good runs!
     model_path = os.path.join(out_dir, "final_model.h5")
     final_model.save(model_path)
     print(f"\nSaved final model to: {model_path}")
     
-    # Evaluation on strictly held-out test_ds
+    # 6. Evaluate over sliding windows for plotting
     print("\nEvaluating on Test Set...")
-    X_test, Y_test_raw, test_groups = extract_sequences(test_ds)
+    
+    # Only generate plots for the true 7 grasp classes
+    true_classes = [c for c in classes if c != "Rest"]
+    
+    test_raw = extract_raw_features(test_ds, window_samples, step_samples, channel_types)
+    X_test, Y_test_raw, test_groups = build_sequences(test_raw, scaler, is_train=True)
     if len(X_test) > 0:
         X_te = X_test
         Y_test_enc = le.transform(Y_test_raw)
@@ -430,8 +472,7 @@ def main():
         
         y_pred_probs = final_model.predict(X_te)
         
-        # Only evaluate the LAST time step (0.0s mark) for the confusion matrix
-        # because the earlier time steps are mostly resting baseline!
+        # Evaluate on the Rest phase and Onset phase
         y_val_last   = Y_te[:, -1]
         y_pred_last  = np.argmax(y_pred_probs[:, -1, :], axis=-1)
         
@@ -478,10 +519,10 @@ def main():
                     feat_seq.append(feat)
                     
                 feat_seq = np.array(feat_seq)
-                feat_mean = np.mean(feat_seq, axis=0, keepdims=True)
-                feat_std = np.std(feat_seq, axis=0, keepdims=True)
-                feat_std[feat_std == 0] = 1e-10
-                feat_seq = (feat_seq - feat_mean) / feat_std
+                if len(feat_seq) >= 5:
+                    baseline_mean = np.mean(feat_seq[:5], axis=0, keepdims=True)
+                    feat_seq = feat_seq - baseline_mean
+                feat_seq = scaler.transform(feat_seq)
                     
                 X_trial = []
                 for i in range(len(feat_seq)):
