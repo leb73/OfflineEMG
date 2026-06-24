@@ -13,3 +13,10 @@ Fixed_IMU_Data
 # Re-ignore specific files so they stay ignored
 5_Trial19_CrossSession_Inference.py
 test_csv.py
+extracted_trials
+*.png
+Dan Testing
+
+
+# do not ignore this file
+!extract_trials_interactive.py
