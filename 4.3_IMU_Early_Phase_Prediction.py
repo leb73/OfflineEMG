@@ -101,7 +101,7 @@ def extract_imu_features(window: np.ndarray) -> np.ndarray:
 # ============================================================================
 def load_and_preprocess_trials(base_dir: str) -> dict:
     dataset = collections.defaultdict(list)
-    trial_folders = sorted(glob.glob(os.path.join(base_dir, "Trial_*_short_*")))
+    trial_folders = sorted(glob.glob(os.path.join(base_dir, "Trial_*_*_Short")))
     
     if not trial_folders:
         print(f"  [WARN] No folders found in: {base_dir}")
@@ -109,13 +109,13 @@ def load_and_preprocess_trials(base_dir: str) -> dict:
 
     for tf_path in trial_folders:
         folder_name = os.path.basename(tf_path)
-        cls_label   = folder_name.split("short_")[-1]
-        movements_dir = os.path.join(tf_path, "extracted_trials")
-        if not os.path.isdir(movements_dir): continue
+        parts = folder_name.split("_")
+        if len(parts) >= 3:
+            cls_label = parts[2]
+        else:
+            continue
 
-        for mov_dir in sorted(glob.glob(os.path.join(movements_dir, "Movement_*"))):
-            csv_path = os.path.join(mov_dir, "delsys_data.csv")
-            if not os.path.isfile(csv_path): continue
+        for csv_path in sorted(glob.glob(os.path.join(tf_path, "movement_*.csv"))):
 
             try:
                 with open(csv_path, 'r') as f:
@@ -260,7 +260,7 @@ def plot_accuracy_over_time(eval_times, acc_history, chance, out_path):
 # MAIN
 # ============================================================================
 def main():
-    base_dir = r"C:\Users\Lucy\Desktop\OfflineEMG\Fixed_IMU_Data"
+    base_dir = r"C:\Users\Lucy\Desktop\OfflineEMG\extracted_trials"
     script_dir = os.path.dirname(os.path.abspath(__file__))
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir = os.path.join(script_dir, "Offline_Training_Results", f"{timestamp}_4.3_IMU_Full_Window")
