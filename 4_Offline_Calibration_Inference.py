@@ -40,9 +40,18 @@ print("starting")
 # ============================================================================
 EMG_FS          = 1926.0
 WINDOW_SIZE_MS  = 150             
-OVERLAP_MS      = 75
+STEP_SIZE_MS    = 50              # 50ms step size as requested
 SEQUENCE_LENGTH = 5
 L2_REG = 0.002
+
+# Phase boundaries (seconds relative to movement onset at t=0)
+NOISE_START  = -1.5
+NOISE_END    = -0.6   # Background noise phase ends here
+EMD_START    = -0.6    # Electromechanical delay starts here
+EMD_END      =  0.0    # Movement onset
+MOVE_END     =  1.5    # Movement phase ends here
+
+REST_LABEL   = "rest"  # Pseudo-class for background noise
 
 # ============================================================================
 # FILTER SETUP
@@ -185,7 +194,22 @@ def get_sub_windows(df_len, window_samples, step_samples):
         start += step_samples
     return windows
 
+
+def compute_window_time(window_end_sample, fs, trial_offset=-1.5):
+    """Convert window end sample index to time relative to onset (t=0).
+    
+    The data spans -1.5s to +1.5s, so sample 0 corresponds to -1.5s.
+    Window time is taken at the END of the window.
+    """
+    return (window_end_sample / fs) + trial_offset
+
+
 def extract_raw_features(ds_dict, window_samples, step_samples, channel_types):
+    """Extract features for each trial, with per-window time stamps.
+    
+    Uses the noise phase (-1.5s to -0.6s) for baseline subtraction per trial.
+    Returns list of (feat_seq, time_seq, cls_name) tuples.
+    """
     raw_trials = []
     for cls_name, trials in ds_dict.items():
         for arr in trials:
@@ -193,81 +217,68 @@ def extract_raw_features(ds_dict, window_samples, step_samples, channel_types):
             if len(sub_wins) < SEQUENCE_LENGTH:
                 continue
             feat_seq = []
+            time_seq = []
             for s, e in sub_wins:
                 feat = extract_window_features(arr[s:e], EMG_FS, channel_types)
                 feat_seq.append(feat)
+                time_seq.append(compute_window_time(e, EMG_FS))
             feat_seq = np.array(feat_seq)
-            if len(feat_seq) >= 5:
-                baseline_mean = np.mean(feat_seq[:5], axis=0, keepdims=True)
+            
+            # Use noise phase (-1.5s to -0.6s) for baseline subtraction
+            noise_indices = [i for i, t in enumerate(time_seq) if t <= NOISE_END]
+            if len(noise_indices) > 0:
+                baseline_mean = np.mean(feat_seq[noise_indices], axis=0, keepdims=True)
                 feat_seq = feat_seq - baseline_mean
-            raw_trials.append((feat_seq, cls_name))
+            
+            raw_trials.append((feat_seq, time_seq, cls_name))
     return raw_trials
 
-def build_sequences(raw_trials, scaler, is_train=False):
-    X_all, Y_raw, groups = [], [], []
+
+def assign_phase_label(t, true_class):
+    """Assign label based on temporal phase.
+    
+    -1.5s to -0.6s → 'rest' (background noise)
+    -0.6s to  0.0s → true_class (electromechanical delay)
+     0.0s to +1.5s → true_class (movement)
+    """
+    if t <= NOISE_END:
+        return REST_LABEL
+    else:
+        return true_class
+
+
+def build_sequences(raw_trials, scaler):
+    """Build input sequences with phase-aware labelling.
+    
+    Every window gets a label:
+      - 'rest' during noise phase
+      - true class during EMD and movement phases
+    """
+    X_all, Y_raw, groups, times_all = [], [], [], []
     t_idx = 0
-    for feat_seq, cls_name in raw_trials:
+    for feat_seq, time_seq, cls_name in raw_trials:
         feat_seq = scaler.transform(feat_seq)
         
-        if is_train:
-            # Burst sequences (preparation phase)
-            start_idx = max(0, len(feat_seq) - 1)
-            for i in range(start_idx, len(feat_seq)):
-                seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
-                if len(seq) < SEQUENCE_LENGTH:
-                    pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
-                    seq = pad + list(seq)
-                X_all.append(seq)
-                Y_raw.append(cls_name)
-                groups.append(t_idx)
-                
-            # Rest sequences (pure baseline noise phase)
-            for i in range(0, min(5, len(feat_seq))):
-                seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
-                if len(seq) < SEQUENCE_LENGTH:
-                    pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
-                    seq = pad + list(seq)
-                X_all.append(seq)
-                Y_raw.append("Rest")
-                groups.append(t_idx)
-        else:
-            for i in range(len(feat_seq)):
-                seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
-                if len(seq) < SEQUENCE_LENGTH:
-                    pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
-                    seq = pad + list(seq)
-                X_all.append(seq)
-                Y_raw.append(cls_name)
-                groups.append(t_idx)
+        for i in range(len(feat_seq)):
+            seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
+            if len(seq) < SEQUENCE_LENGTH:
+                pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
+                seq = pad + list(seq)
+            X_all.append(seq)
+            Y_raw.append(assign_phase_label(time_seq[i], cls_name))
+            groups.append(t_idx)
+            times_all.append(time_seq[i])
                 
         t_idx += 1
     if len(X_all) == 0:
-        return np.array([]), np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([]), np.array([])
         
     X_arr = np.array(X_all)
     Y_arr = np.array(Y_raw)
     groups_arr = np.array(groups)
+    times_arr = np.array(times_all)
     
-    if is_train:
-        # Balance Rest class to match the average support of other classes
-        unique_classes, counts = np.unique(Y_arr, return_counts=True)
-        non_rest_counts = [count for cls, count in zip(unique_classes, counts) if cls != "Rest"]
-        if non_rest_counts and "Rest" in unique_classes:
-            target_rest_count = int(np.mean(non_rest_counts))
-            rest_indices = np.where(Y_arr == "Rest")[0]
-            non_rest_indices = np.where(Y_arr != "Rest")[0]
-            
-            if len(rest_indices) > target_rest_count:
-                rng = np.random.RandomState(42)
-                keep_rest_indices = rng.choice(rest_indices, target_rest_count, replace=False)
-                keep_indices = np.concatenate([non_rest_indices, keep_rest_indices])
-                keep_indices.sort()
-                
-                X_arr = X_arr[keep_indices]
-                Y_arr = Y_arr[keep_indices]
-                groups_arr = groups_arr[keep_indices]
-                
-    return X_arr, Y_arr, groups_arr
+    return X_arr, Y_arr, groups_arr, times_arr
 
 # ============================================================================
 # MODEL DEFINITION
@@ -333,10 +344,10 @@ def main():
                 # Drop units and metadata rows
                 df = df.iloc[2:].reset_index(drop=True)
                 
-                # Filter for -1.5s to 0s based on the primary time column
+                # Filter for -1.5s to 1.5s based on the primary time column
                 time_col = [c for c in df.columns if 'Time' in c][0]
                 df[time_col] = pd.to_numeric(df[time_col], errors='coerce')
-                df = df[(df[time_col] >= -1.5) & (df[time_col] <= 0.0)].reset_index(drop=True)
+                df = df[(df[time_col] >= NOISE_START) & (df[time_col] <= MOVE_END)].reset_index(drop=True)
                 
                 emg_cols = [c for c in df.columns if 'EMG' in c and '(mV)' in c]
                 
@@ -360,12 +371,22 @@ def main():
     print("\nDataset Summary:")
     for cls, trials in dataset.items():
         print(f"  {cls}: {len(trials)} trials")
-        
-    classes = sorted(list(dataset.keys()))
-    classes.append("Rest")
-    le = LabelEncoder()
-    le.fit(classes)
     
+    # Build class list: movement classes + rest
+    movement_classes = sorted(list(dataset.keys()))
+    all_classes = movement_classes + [REST_LABEL]
+    le = LabelEncoder()
+    le.fit(all_classes)
+    
+    print(f"\nClasses: {list(le.classes_)}")
+    print(f"  Movement classes: {movement_classes}")
+    print(f"  Rest class index: {le.transform([REST_LABEL])[0]}")
+    
+    # Ensure all classes have the same number of trials
+    min_trials = min([len(v) for v in dataset.values()])
+    for cls in dataset.keys():
+        dataset[cls] = random.sample(dataset[cls], min_trials)
+
     # 70/15/15 Split per class based on trials
     train_ds, val_ds, test_ds = collections.defaultdict(list), collections.defaultdict(list), collections.defaultdict(list)
     rng = np.random.RandomState(42)
@@ -394,7 +415,9 @@ def main():
     print(f"  Test:  {sum(len(v) for v in test_ds.values())}")
     
     window_samples = int((WINDOW_SIZE_MS / 1000) * EMG_FS)
-    step_samples   = int(((WINDOW_SIZE_MS - OVERLAP_MS) / 1000) * EMG_FS)
+    step_samples   = int((STEP_SIZE_MS / 1000) * EMG_FS)
+    
+    print(f"\nWindow: {WINDOW_SIZE_MS}ms ({window_samples} samples), Step: {STEP_SIZE_MS}ms ({step_samples} samples)")
     
     print("\nExtracting Features (this may take a moment)...")
     train_raw = extract_raw_features(train_ds, window_samples, step_samples, channel_types)
@@ -405,12 +428,18 @@ def main():
     if len(all_train_feats) > 0:
         scaler.fit(all_train_feats)
         
-    X_train, Y_train_raw, _ = build_sequences(train_raw, scaler, is_train=True)
-    X_val, Y_val_raw, val_groups = build_sequences(val_raw, scaler, is_train=True)
+    X_train, Y_train_raw, _, train_times = build_sequences(train_raw, scaler)
+    X_val, Y_val_raw, val_groups, val_times = build_sequences(val_raw, scaler)
     
     if len(X_train) == 0 or len(X_val) == 0:
         print("Not enough sequences for training/validation. Exiting.")
         return
+    
+    # Print label distribution
+    unique_train, counts_train = np.unique(Y_train_raw, return_counts=True)
+    print("\nTraining label distribution:")
+    for lbl, cnt in zip(unique_train, counts_train):
+        print(f"  {lbl}: {cnt}")
         
     Y_train_enc = le.transform(Y_train_raw)
     Y_val_enc   = le.transform(Y_val_raw)
@@ -425,9 +454,10 @@ def main():
     X_v = X_val
     
     input_shape = (T_, F_)
-    num_classes = len(classes)
+    num_classes = len(all_classes)
     
     print(f"\nSequence Shapes: Train {X_t.shape}, Val {X_v.shape}")
+    print(f"Num classes (including rest): {num_classes}")
     
     # HPO Loop
     param_space = {
@@ -478,179 +508,291 @@ def main():
     final_model.save(model_path)
     print(f"\nSaved final model to: {model_path}")
     
-    # 6. Evaluate over sliding windows for plotting
-    print("\nEvaluating on Test Set...")
+    # ========================================================================
+    # EVALUATION — Per-timestep sliding window metrics
+    # ========================================================================
+    print("\nEvaluating on Test Set with per-timestep metrics...")
     
-    # Only generate plots for the true 7 grasp classes
-    true_classes = [c for c in classes if c != "Rest"]
+    plot_dir = os.path.join(out_dir, "Accuracy_Plots")
+    metrics_dir = os.path.join(out_dir, "Metrics_Over_Time")
+    os.makedirs(plot_dir, exist_ok=True)
+    os.makedirs(metrics_dir, exist_ok=True)
     
-    test_raw = extract_raw_features(test_ds, window_samples, step_samples, channel_types)
-    X_test, Y_test_raw, test_groups = build_sequences(test_raw, scaler, is_train=True)
-    if len(X_test) > 0:
-        X_te = X_test
-        Y_test_enc = le.transform(Y_test_raw)
-        Y_te = np.repeat(Y_test_enc[:, np.newaxis], SEQUENCE_LENGTH, axis=1)
+    # Collect predictions per trial, aligned by time step
+    # global_true_rest: includes rest labels for noise phase (for confusion matrices)
+    # global_true_move: always the true movement class (for accuracy-over-time plots)
+    global_true_rest = []   # list of arrays with rest labels during noise
+    global_true_move = []   # list of arrays with true movement class at all times
+    global_preds = []       # list of arrays: model predictions
+    global_pred_times = None
+    
+    for cls_name, trials in test_ds.items():
+        cls_idx = le.transform([cls_name])[0]
+        rest_idx = le.transform([REST_LABEL])[0]
         
-        y_pred_probs = final_model.predict(X_te)
+        all_trial_accuracies = []
+        pred_times = None
         
-        # Evaluate on the Rest phase and Onset phase
-        y_val_last   = Y_te[:, -1]
-        y_pred_last  = np.argmax(y_pred_probs[:, -1, :], axis=-1)
+        for t_idx, arr in enumerate(trials):
+            sub_wins = get_sub_windows(len(arr), window_samples, step_samples)
+            if len(sub_wins) < SEQUENCE_LENGTH: continue
+            
+            feat_seq = []
+            time_seq = []
+            for s, e in sub_wins:
+                feat = extract_window_features(arr[s:e], EMG_FS, channel_types)
+                feat_seq.append(feat)
+                time_seq.append(compute_window_time(e, EMG_FS))
+                
+            feat_seq = np.array(feat_seq)
+            
+            # Baseline subtraction using noise phase
+            noise_indices = [i for i, t in enumerate(time_seq) if t <= NOISE_END]
+            if len(noise_indices) > 0:
+                baseline_mean = np.mean(feat_seq[noise_indices], axis=0, keepdims=True)
+                feat_seq = feat_seq - baseline_mean
+            
+            feat_seq = scaler.transform(feat_seq)
+                
+            X_trial = []
+            for i in range(len(feat_seq)):
+                seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
+                if len(seq) < SEQUENCE_LENGTH:
+                    pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
+                    seq = pad + list(seq)
+                X_trial.append(seq)
+            X_trial = np.array(X_trial)
+            
+            preds = final_model(X_trial, training=False).numpy()
+            pred_classes = np.argmax(preds[:, -1, :], axis=-1)
+            
+            # True labels WITH rest (for confusion matrices)
+            true_labels_rest = np.array([
+                rest_idx if t <= NOISE_END else cls_idx
+                for t in time_seq
+            ])
+            # True labels as MOVEMENT CLASS at all times (for accuracy plots)
+            true_labels_move = np.full(len(time_seq), cls_idx)
+            
+            # Per-class accuracy: does the model predict the correct MOVEMENT class?
+            accuracies = (pred_classes == cls_idx).astype(float) * 100.0
+            all_trial_accuracies.append(accuracies)
+            
+            global_true_rest.append(true_labels_rest)
+            global_true_move.append(true_labels_move)
+            global_preds.append(pred_classes)
+            
+            if pred_times is None:
+                pred_times = time_seq
+            if global_pred_times is None:
+                global_pred_times = pred_times
+                
+        if not all_trial_accuracies:
+            continue
+            
+        # Per-class average accuracy bar plot
+        min_len = min(len(acc) for acc in all_trial_accuracies)
+        avg_accuracies = np.mean([acc[:min_len] for acc in all_trial_accuracies], axis=0)
+        avg_pred_times = pred_times[:min_len]
         
-        test_acc = accuracy_score(y_val_last, y_pred_last) * 100
-        print(f"\nFinal Time-Step Test Accuracy: {test_acc:.2f}%")
+        plt.figure(figsize=(12, 5))
+        plt.bar(avg_pred_times, avg_accuracies, width=0.04, edgecolor="black", color='#00d4ff', alpha=0.8)
+        plt.axvline(x=NOISE_END, color='orange', linestyle='--', linewidth=1.5, label=f'Noise→EMD ({NOISE_END}s)')
+        plt.axvline(x=0.0, color='r', linestyle='--', linewidth=1.5, label='Movement Onset')
+        plt.ylim(0, 105)
+        plt.xlim(NOISE_START, MOVE_END)
+        plt.title(f"Average Accuracy Over Time — Class: {cls_name} ({len(all_trial_accuracies)} trials)")
+        plt.xlabel("Time Relative to Onset (s)")
+        plt.ylabel(f"Accuracy (%)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plot_dir, f"Average_{cls_name}.png"), dpi=150)
+        plt.close()
         
-        # Confusion Matrix
-        cm = confusion_matrix(y_val_last, y_pred_last)
+    # ========================================================================
+    # Global per-timestep metrics
+    # ========================================================================
+    if global_preds:
+        global_min_len = min(len(p) for p in global_preds)
+        global_preds_trunc = np.array([p[:global_min_len] for p in global_preds])
+        global_true_rest_trunc = np.array([t[:global_min_len] for t in global_true_rest])
+        global_true_move_trunc = np.array([t[:global_min_len] for t in global_true_move])
+        global_times_trunc = global_pred_times[:global_min_len]
+        
+        # Movement-class accuracy over time (what the user wants to see)
+        overall_move_accuracies = []
+        
+        # Per-class accuracy over time for each movement class
+        class_accuracies_over_time = {cls: [] for cls in movement_classes}
+        
+        print(f"\nGenerating metrics for {global_min_len} time steps...")
+        
+        for t_i in range(global_min_len):
+            y_true_rest_t = global_true_rest_trunc[:, t_i]  # with rest labels
+            y_true_move_t = global_true_move_trunc[:, t_i]  # movement class only
+            y_pred_t = global_preds_trunc[:, t_i]
+            
+            # Movement classification accuracy: does the model predict the correct
+            # movement class? During noise, it predicts 'rest' → wrong → low accuracy.
+            move_acc_t = accuracy_score(y_true_move_t, y_pred_t) * 100.0
+            overall_move_accuracies.append(move_acc_t)
+            
+            # Per-movement-class accuracy (recall) at this time step
+            for cls_name in movement_classes:
+                cls_idx = le.transform([cls_name])[0]
+                mask = (y_true_move_t == cls_idx)
+                if mask.sum() > 0:
+                    cls_acc = (y_pred_t[mask] == cls_idx).mean() * 100.0
+                    class_accuracies_over_time[cls_name].append(cls_acc)
+                else:
+                    class_accuracies_over_time[cls_name].append(np.nan)
+            
+            # Confusion matrix for this time step (includes rest in labels)
+            t_val = global_times_trunc[t_i]
+            cm_t = confusion_matrix(y_true_rest_t, y_pred_t, labels=range(len(le.classes_)))
+            # Also compute accuracy including rest for the confusion matrix title
+            acc_with_rest_t = accuracy_score(y_true_rest_t, y_pred_t) * 100.0
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(cm_t, annot=True, fmt='d', cmap='Blues', xticklabels=le.classes_, yticklabels=le.classes_)
+            plt.title(f"Confusion Matrix (t={t_val:+.3f}s)\nMove Acc: {move_acc_t:.1f}% | With Rest: {acc_with_rest_t:.1f}%")
+            plt.ylabel('True')
+            plt.xlabel('Predicted')
+            plt.tight_layout()
+            plt.savefig(os.path.join(metrics_dir, f"cm_t{t_i:03d}_{t_val:+.3f}s.png"), dpi=100)
+            plt.close()
+            
+            # Classification report for this time step (uses rest labels)
+            report = classification_report(
+                y_true_rest_t, y_pred_t, 
+                labels=range(len(le.classes_)), 
+                target_names=le.classes_, 
+                output_dict=True, 
+                zero_division=0
+            )
+            pd.DataFrame(report).transpose().to_csv(
+                os.path.join(metrics_dir, f"report_t{t_i:03d}_{t_val:+.3f}s.csv")
+            )
+        
+        # ====================================================================
+        # Overall accuracy over time plot
+        # ====================================================================
+        plt.figure(figsize=(12, 6))
+        plt.plot(global_times_trunc, overall_move_accuracies, marker='o', markersize=3, linewidth=2, color='#2196F3', label='Movement Classification Accuracy')
+        plt.axvline(x=NOISE_END, color='orange', linestyle='--', linewidth=1.5, label=f'Noise→EMD ({NOISE_END}s)')
+        plt.axvline(x=0.0, color='r', linestyle='--', linewidth=1.5, label='Movement Onset')
+        chance_level = 100.0 / len(movement_classes)
+        plt.axhline(y=chance_level, color='gray', linestyle=':', alpha=0.5, label=f'Chance ({chance_level:.0f}%)')
+        plt.title('Movement Classification Accuracy Over Time')
+        plt.xlabel('Time Relative to Onset (s)')
+        plt.ylabel('Accuracy (%)')
+        plt.xlim(NOISE_START, MOVE_END)
+        plt.ylim(-5, 105)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(plot_dir, "Overall_Accuracy_Over_Time.png"), dpi=150)
+        plt.close()
+        
+        # ====================================================================
+        # Per-class accuracy over time plot
+        # ====================================================================
+        plt.figure(figsize=(14, 7))
+        
+        cmap = plt.colormaps['tab10']
+        
+        for i, cls_name in enumerate(movement_classes):
+            accs = class_accuracies_over_time[cls_name]
+            plt.plot(global_times_trunc, accs, marker='.', markersize=2, linewidth=1.5, 
+                     color=cmap(i), label=f'{cls_name}', alpha=0.85)
+        
+        plt.axvline(x=NOISE_END, color='orange', linestyle=':', linewidth=1.5, label=f'Noise→EMD ({NOISE_END}s)')
+        plt.axvline(x=0.0, color='r', linestyle=':', linewidth=1.5, label='Movement Onset')
+        
+        chance_level = 100.0 / len(movement_classes)
+        plt.axhline(y=chance_level, color='gray', linestyle=':', alpha=0.5, label=f'Chance ({chance_level:.0f}%)')
+        
+        plt.title('Per-Class Movement Accuracy (Recall) Over Time')
+        plt.xlabel('Time Relative to Onset (s)')
+        plt.ylabel('Accuracy (%)')
+        plt.xlim(NOISE_START, MOVE_END)
+        plt.ylim(-5, 105)
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=9)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plot_dir, "Per_Class_Accuracy_Over_Time.png"), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # ====================================================================
+        # Average accuracy summary
+        # ====================================================================
+        avg_overall = np.mean(overall_move_accuracies)
+        
+        # Compute average accuracy per phase
+        noise_mask = np.array(global_times_trunc) <= NOISE_END
+        emd_mask = (np.array(global_times_trunc) > NOISE_END) & (np.array(global_times_trunc) <= EMD_END)
+        move_mask = np.array(global_times_trunc) > EMD_END
+        
+        avg_noise = np.mean([overall_move_accuracies[i] for i in range(len(overall_move_accuracies)) if noise_mask[i]]) if noise_mask.any() else 0
+        avg_emd = np.mean([overall_move_accuracies[i] for i in range(len(overall_move_accuracies)) if emd_mask[i]]) if emd_mask.any() else 0
+        avg_move = np.mean([overall_move_accuracies[i] for i in range(len(overall_move_accuracies)) if move_mask[i]]) if move_mask.any() else 0
+        
+        summary_text = (
+            f"{'='*60}\n"
+            f"MOVEMENT CLASSIFICATION ACCURACY SUMMARY\n"
+            f"{'='*60}\n"
+            f"Overall Average Accuracy:          {avg_overall:.2f}%\n"
+            f"  Noise Phase   ({NOISE_START}s to {NOISE_END}s): {avg_noise:.2f}%\n"
+            f"  EMD Phase     ({EMD_START}s to {EMD_END}s):  {avg_emd:.2f}%\n"
+            f"  Movement Phase ({EMD_END}s to {MOVE_END}s):  {avg_move:.2f}%\n"
+            f"{'='*60}\n"
+            f"\nPer-class average movement accuracy over time:\n"
+        )
+        
+        for cls_name in movement_classes:
+            accs = class_accuracies_over_time[cls_name]
+            valid_accs = [a for a in accs if not np.isnan(a)]
+            if valid_accs:
+                summary_text += f"  {cls_name:>10s}: {np.mean(valid_accs):.2f}%\n"
+            else:
+                summary_text += f"  {cls_name:>10s}: N/A\n"
+        
+        print(f"\n{summary_text}")
+        
+        # Save summary to file
+        with open(os.path.join(out_dir, "accuracy_summary.txt"), 'w') as f:
+            f.write(summary_text)
+        
+        # Also save a final overall confusion matrix (aggregated over all timesteps)
+        # Use rest labels for the confusion matrix so rest predictions are visible
+        all_true_flat = global_true_rest_trunc.flatten()
+        all_pred_flat = global_preds_trunc.flatten()
+        
+        cm_overall = confusion_matrix(all_true_flat, all_pred_flat, labels=range(len(le.classes_)))
+        overall_acc = accuracy_score(all_true_flat, all_pred_flat) * 100
+        
         plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+        sns.heatmap(cm_overall, annot=True, fmt='d', cmap='Blues',
                     xticklabels=le.classes_, yticklabels=le.classes_)
-        plt.title(f"Test Set Confusion Matrix\nAccuracy: {test_acc:.2f}%")
+        plt.title(f"Overall Test Confusion Matrix (All Time Steps)\nAccuracy: {overall_acc:.2f}%")
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, "confusion_matrix.png"), dpi=150)
         plt.close()
-        print(f"Saved confusion matrix to {out_dir}")
         
-        report = classification_report(y_val_last, y_pred_last, target_names=le.classes_, output_dict=True, zero_division=0)
-        pd.DataFrame(report).transpose().to_csv(os.path.join(out_dir, "classification_report.csv"))
+        report_overall = classification_report(
+            all_true_flat, all_pred_flat, 
+            labels=range(len(le.classes_)), 
+            target_names=le.classes_, 
+            output_dict=True, 
+            zero_division=0
+        )
+        pd.DataFrame(report_overall).transpose().to_csv(os.path.join(out_dir, "classification_report.csv"))
         
-        # Plot sliding window accuracy per test trial
-        plot_dir = os.path.join(out_dir, "Accuracy_Plots")
-        os.makedirs(plot_dir, exist_ok=True)
-        
-        target_subset_classes = ['mug', 'card', 'bottle']
-        subset_trial_accuracies = []
-        subset_pred_times = None
-        
-        global_true = []
-        global_preds = []
-        global_pred_times = None
-        
-        for cls_name, trials in test_ds.items():
-            cls_idx = le.transform([cls_name])[0]
-            
-            all_trial_accuracies = []
-            pred_times = None
-            
-            for t_idx, arr in enumerate(trials):
-                sub_wins = get_sub_windows(len(arr), window_samples, step_samples)
-                if len(sub_wins) < SEQUENCE_LENGTH: continue
-                
-                feat_seq = []
-                for s, e in sub_wins:
-                    feat = extract_window_features(arr[s:e], EMG_FS, channel_types)
-                    feat_seq.append(feat)
-                    
-                feat_seq = np.array(feat_seq)
-                if len(feat_seq) >= 5:
-                    baseline_mean = np.mean(feat_seq[:5], axis=0, keepdims=True)
-                    feat_seq = feat_seq - baseline_mean
-                feat_seq = scaler.transform(feat_seq)
-                    
-                X_trial = []
-                for i in range(len(feat_seq)):
-                    seq = feat_seq[max(0, i - SEQUENCE_LENGTH + 1) : i + 1]
-                    if len(seq) < SEQUENCE_LENGTH:
-                        pad = [np.zeros_like(seq[0])] * (SEQUENCE_LENGTH - len(seq))
-                        seq = pad + list(seq)
-                    X_trial.append(seq)
-                X_trial = np.array(X_trial)
-                
-                preds = final_model(X_trial, training=False).numpy()
-                pred_classes = np.argmax(preds[:, -1, :], axis=-1)
-                accuracies = (pred_classes == cls_idx).astype(float) * 100.0
-                all_trial_accuracies.append(accuracies)
-                if cls_name in target_subset_classes:
-                    subset_trial_accuracies.append(accuracies)
-                
-                global_true.append(cls_idx)
-                global_preds.append(pred_classes)
-                
-                if pred_times is None:
-                    pred_times = [(e / EMG_FS) - 1.5 for s, e in sub_wins]
-                if global_pred_times is None:
-                    global_pred_times = pred_times
-                if cls_name in target_subset_classes and subset_pred_times is None:
-                    subset_pred_times = [(e / EMG_FS) - 1.5 for s, e in sub_wins]
-                    
-            if not all_trial_accuracies:
-                continue
-                
-            min_len = min(len(acc) for acc in all_trial_accuracies)
-            avg_accuracies = np.mean([acc[:min_len] for acc in all_trial_accuracies], axis=0)
-            avg_pred_times = pred_times[:min_len]
-            
-            plt.figure(figsize=(10, 4))
-            plt.bar(avg_pred_times, avg_accuracies, width=0.07, edgecolor ="black", color='#00d4ff', alpha=0.8)
-            plt.ylim(0, 105)
-            plt.xlim(-1.5, 0.0)
-            plt.title(f"Average Accuracy Over Time - True Class: {cls_name} ({len(all_trial_accuracies)} trials)")
-            plt.xlabel("Time (s)")
-            plt.ylabel(f"Accuracy for '{cls_name}' (%)")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, f"Average_{cls_name}.png"), dpi=150)
-            plt.close()
-            
-        if subset_trial_accuracies:
-            min_len = min(len(acc) for acc in subset_trial_accuracies)
-            subset_avg = np.mean([acc[:min_len] for acc in subset_trial_accuracies], axis=0)
-            avg_pred_times = subset_pred_times[:min_len]
-            
-            plt.figure(figsize=(10, 4))
-            plt.bar(avg_pred_times, subset_avg, width=0.07, edgecolor="black", color='#ffaa00', alpha=0.8)
-            plt.ylim(0, 105)
-            plt.xlim(-1.5, 0.0)
-            plt.title(f"Average Accuracy Over Time - Subset: Mug, Card, Bottle ({len(subset_trial_accuracies)} trials)")
-            plt.xlabel("Time (s)")
-            plt.ylabel(f"Average Accuracy (%)")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, f"Average_Subset_MugCardBottle.png"), dpi=150)
-            plt.close()
-            
-        if global_preds:
-            global_min_len = min(len(p) for p in global_preds)
-            global_preds_trunc = np.array([p[:global_min_len] for p in global_preds])
-            global_true_arr = np.array(global_true)
-            global_times_trunc = global_pred_times[:global_min_len]
-            
-            overall_accuracies = []
-            metrics_dir = os.path.join(out_dir, "Metrics_Over_Time")
-            os.makedirs(metrics_dir, exist_ok=True)
-            
-            for t_i in range(global_min_len):
-                y_pred_t = global_preds_trunc[:, t_i]
-                acc_t = accuracy_score(global_true_arr, y_pred_t) * 100.0
-                overall_accuracies.append(acc_t)
-                
-                t_val = global_times_trunc[t_i]
-                cm_t = confusion_matrix(global_true_arr, y_pred_t, labels=range(len(le.classes_)))
-                plt.figure(figsize=(8, 6))
-                sns.heatmap(cm_t, annot=True, fmt='d', cmap='Blues', xticklabels=le.classes_, yticklabels=le.classes_)
-                plt.title(f"Confusion Matrix (t={t_val:+.2f}s)\nAccuracy: {acc_t:.1f}%")
-                plt.ylabel('True')
-                plt.xlabel('Predicted')
-                plt.tight_layout()
-                plt.savefig(os.path.join(metrics_dir, f"cm_t_{t_val:+.2f}s.png"))
-                plt.close()
-                
-            plt.figure(figsize=(10, 6))
-            plt.plot(global_times_trunc, overall_accuracies, marker='o', linewidth=2)
-            plt.axvline(x=0.0, color='r', linestyle='--', label='Movement Onset')
-            plt.title('Overall Accuracy Over Time')
-            plt.xlabel('Time Relative to Onset (s)')
-            plt.ylabel('Accuracy (%)')
-            plt.grid(True)
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, "Overall_Accuracy_Over_Time.png"))
-            plt.close()
-            print(f"Saved timestep confusion matrices to {metrics_dir}")
-
-        print(f"Saved sliding window average accuracy plots to {plot_dir}")
+        print(f"\nSaved confusion matrices per timestep to {metrics_dir}")
+        print(f"Saved accuracy plots to {plot_dir}")
+        print(f"Saved overall confusion matrix and report to {out_dir}")
     else:
         print("No test set sequences could be extracted.")
 
