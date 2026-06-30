@@ -55,8 +55,8 @@ T_END_S       = 1.5
 BASELINE_START_S = -1.5
 BASELINE_END_S   = -0.5
 
-WINDOW_MS     = 200
-STEP_MS       = 50
+WINDOW_MS     = 100
+STEP_MS       = 25
 
 WINDOW_S      = WINDOW_MS / 1000.0
 STEP_S        = STEP_MS  / 1000.0
@@ -260,7 +260,7 @@ def plot_accuracy_over_time(eval_times, acc_history, chance, out_path):
 # MAIN
 # ============================================================================
 def main():
-    base_dir = r"C:\Users\Lucy\Desktop\OfflineEMG\extracted_trials"
+    base_dir = r"C:\Users\Lucy\Desktop\OfflineEMG\extracted_trials_shifted"
     script_dir = os.path.dirname(os.path.abspath(__file__))
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir = os.path.join(script_dir, "Offline_Training_Results", f"{timestamp}_4.3_IMU_Full_Window")
